@@ -1,0 +1,5 @@
+- AP SSID should be iot-minchee-partoftheMacAddress
+- automatically load the settings page when connected to the AP
+- settings page UI styling
+- refactoring with classes for settings (create AP, load the settings page, save the settings and reboot), MQTT
+- deviceName should be a predefined string + partoftheMacAddress
