@@ -1,115 +1,151 @@
 #include <PubSubClient.h>
 #include <ESP8266WiFi.h>
-#include <ESP8266WiFiAP.h>
-#include <ESP8266WiFiGeneric.h>
-#include <ESP8266WiFiMulti.h>
-#include <ESP8266WiFiScan.h>
-#include <ESP8266WiFiSTA.h>
-#include <ESP8266WiFiType.h>
-#include <WiFiClient.h>
-#include <WiFiClientSecure.h>
-#include <WiFiServer.h>
-#include <WiFiUdp.h>
+#include <WiFiClient.h> 
+#include <ESP8266WebServer.h>
+#include <DNSServer.h>
+#include <ESP8266mDNS.h>
+#include <EEPROM.h>
 
-#define mqtt_server "192.168.2.170"
-#define mqtt_user ""
-#define mqtt_password ""
 
-#define wifi_ssid "MWN"
-#define wifi_password "marcoswireless"
+/*
+ * This example serves a "hello world" on a WLAN and a SoftAP at the same time.
+ * The SoftAP allow you to configure WLAN parameters at run time. They are not setup in the sketch but saved on EEPROM.
+ * 
+ * Connect your computer or cell phone to wifi network ESP_ap with password 12345678. A popup may appear and it allow you to go to WLAN config. If it does not then navigate to http://192.168.4.1/wifi and config it there.
+ * Then wait for the module to connect to your wifi and take note of the WLAN IP it got. Then you can disconnect from ESP_ap and return to your regular WLAN.
+ * 
+ * Now the ESP8266 is in your network. You can reach it through http://192.168.x.x/ (the IP you took note of) or maybe at http://esp8266.local too.
+ * 
+ * This is a captive portal because through the softAP it will redirect any http request to http://192.168.4.1/
+ */
 
-#define LED 2
+/* Set these to your desired softAP credentials. They are not configurable at runtime */
+const char *softAP_ssid = "The LAMP";
+const char *softAP_password = "connected";
 
+/* hostname for mDNS. Should work at least on windows. Try http://esp8266.local */
+const char *myHostname = "lamp";
+
+/* Don't set this wifi credentials. They are configurated at runtime and stored on EEPROM */
+char ssid[32] = "";
+char password[32] = "";
+char mqtt_host[32] = "";
+
+// DNS server
+const byte DNS_PORT = 53;
+DNSServer dnsServer;
+
+// MQTT Client
 WiFiClient espClient;
 PubSubClient client(espClient);
 
-void setup_wifi() {
-  delay(10);
-  // We start by connecting to a WiFi network
-  Serial.println();
-  Serial.print("Connecting to ");
-  Serial.println(wifi_ssid);
+// Web server
+ESP8266WebServer server(80);
 
-  WiFi.disconnect();
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(wifi_ssid, wifi_password);
+/* Soft AP network parameters */
+IPAddress apIP(192, 168, 4, 1);
+IPAddress netMsk(255, 255, 255, 0);
 
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
 
-  Serial.println("");
-  Serial.println("WiFi connected");
-  Serial.println("IP address: ");
-  Serial.println(WiFi.localIP());
-}
+/** Should I connect to WLAN asap? */
+boolean connect;
 
-void reconnect() {
-  // Loop until we're reconnected
-  while (!client.connected()) {
-    Serial.print("Attempting MQTT connection...");
-    // Attempt to connect
-    // If you do not want to use a username and password, change next line to
-    // if (client.connect("ESP8266Client")) {
-    if (client.connect("ESP8266Client", mqtt_user, mqtt_password)) {
-      Serial.println("connected");
+/** Last time I tried to connect to WLAN */
+long lastConnectTry = 0;
 
-      Serial.println("Subscribe to led_test");
-      client.subscribe("led_test");
-    } else {
-      Serial.print("failed, rc=");
-      Serial.print(client.state());
-      Serial.println(" try again in 5 seconds");
-      // Wait 5 seconds before retrying
-      delay(5000);
-    }
-  }
-}
-
-void callback(char* topic, byte* payload, unsigned int length) {
-  Serial.print("Message arrived [");
-  Serial.print(topic);
-  Serial.print("] ");
-  for (int i = 0; i < length; i++) {
-    Serial.print((char)payload[i]);
-  }
-  Serial.println();
-
-  // Switch on the LED if an 1 was received as first character
-  if ((char)payload[0] == '1') {
-    Serial.println("Switch ON");
-    digitalWrite(LED, LOW);   // Turn the LED on (Note that LOW is the voltage level
-
-    // but actually the LED is on; this is because
-    // it is acive low on the ESP-01)
-  } else {
-        Serial.println("Switch OFF");
-    digitalWrite(LED, HIGH);  // Turn the LED off by making the voltage HIGH
-  }
-}
+/** Current WLAN status */
+int status = WL_IDLE_STATUS;
 
 void setup() {
+  delay(1000);
   Serial.begin(115200);
-  pinMode(LED, OUTPUT);
+  Serial.println();
+  Serial.print("Configuring access point...");
+  /* You can remove the password parameter if you want the AP to be open. */
+  WiFi.softAPConfig(apIP, apIP, netMsk);
+  WiFi.softAP(softAP_ssid, softAP_password);
+  delay(500); // Without delay I've seen the IP address blank
+  Serial.print("AP IP address: ");
+  Serial.println(WiFi.softAPIP());
 
-  setup_wifi();
-  client.setServer(mqtt_server, 1883);
-  client.setCallback(callback);
+  /* Setup the DNS server redirecting all the domains to the apIP */  
+  dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
+  dnsServer.start(DNS_PORT, "*", apIP);
+
+  /* Setup web pages: root, wifi config pages, SO captive portal detectors and not found. */
+  server.on("/", handleRoot);
+  server.on("/wifi", handleWifi);
+  server.on("/wifisave", handleWifiSave);
+  server.on("/generate_204", handleRoot);  //Android captive portal. Maybe not needed. Might be handled by notFound handler.
+  server.on("/fwlink", handleRoot);  //Microsoft captive portal. Maybe not needed. Might be handled by notFound handler.
+  server.onNotFound ( handleNotFound );
+  server.begin(); // Web server start
+  Serial.println("HTTP server started");
+  loadCredentials(); // Load WLAN credentials from network
+  connect = strlen(ssid) > 0; // Request WLAN connect if there is a SSID
 }
 
-long lastMsg = 0;
+void connectWifi() {
+  Serial.println("Connecting as wifi client...");
+  WiFi.disconnect();
+  WiFi.begin ( ssid, password );
+  int connRes = WiFi.waitForConnectResult();
+  Serial.print ( "connRes: " );
+  Serial.println ( connRes );
+}
 
 void loop() {
-  if (!client.connected()) {
-    reconnect();
+  if (connect) {
+    Serial.println ( "Connect requested" );
+    connect = false;
+    connectWifi();
+    lastConnectTry = millis();
   }
-  client.loop();
+  {
+    int s = WiFi.status();
+    if (s == 0 && millis() > (lastConnectTry + 60000) ) {
+      /* If WLAN disconnected and idle try to connect */
+      /* Don't set retry time too low as retry interfere the softAP operation */
+      connect = true;
+    }
+    if (status != s) { // WLAN status change
+      Serial.print ( "Status: " );
+      Serial.println ( s );
+      status = s;
+      if (s == WL_CONNECTED) {
+        /* Just connected to WLAN */
+        Serial.println ( "" );
+        Serial.print ( "Connected to " );
+        Serial.println ( ssid );
+        Serial.print ( "IP address: " );
+        Serial.println ( WiFi.localIP() );
 
-  long now = millis();
-  if (now - lastMsg > 1000) {
-    
-    //Serial.println("sending message to MQTT");
+        // Setup MDNS responder
+        if (!MDNS.begin(myHostname)) {
+          Serial.println("Error setting up MDNS responder!");
+        } else {
+          Serial.println("mDNS responder started");
+          // Add service to MDNS-SD
+          MDNS.addService("http", "tcp", 80);
+        }
+
+        // Setup MQTT connection
+        mqttConnect();
+
+        if (client.state() != MQTT_CONNECTED) {
+          WiFi.softAPdisconnect();
+        }
+      } else if (s == WL_NO_SSID_AVAIL) {
+        WiFi.disconnect();
+      }
+    }
   }
+  // Do work:
+  //DNS
+  dnsServer.processNextRequest();
+  //HTTP
+  server.handleClient();
 }
+
+
 
